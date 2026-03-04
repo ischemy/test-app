@@ -1,0 +1,13 @@
+version: '3.8'
+services:
+  test-app:
+    image: my-reg.biznet.id/test-app:latest
+    container_name: test-app-container
+    ports:
+      - "8080:8080"
+    environment:
+      DB_HOST: 10.192.15.6
+      DB_USER: admintest
+      DB_PASSWORD: admin123
+      DB_NAME: postgres
+    restart: always
