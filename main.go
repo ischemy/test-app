@@ -11,9 +11,10 @@ import (
 )
 
 func main() {
-	dbHost := os.Getenv("DB_HOST") // 10.192.15.6
-	dbUser := os.Getenv("DB_USER")
-	dbPass := os.Getenv("DB_PASSWORD")
+	// Konfigurasi diambil dari Docker Compose environment
+	dbHost := os.Getenv("DB_HOST")     // 10.192.15.6
+	dbUser := os.Getenv("DB_USER")     // postgres
+	dbPass := os.Getenv("DB_PASSWORD") 
 	dbName := os.Getenv("DB_NAME")
 
 	dsn := fmt.Sprintf("host=%s port=5432 user=%s password=%s dbname=%s sslmode=disable",
@@ -21,18 +22,19 @@ func main() {
 
 	db, err := sql.Open("postgres", dsn)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("Error open connection: %v", err)
 	}
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		err := db.Ping()
 		if err != nil {
-			fmt.Fprintf(w, "Status: Gagal koneksi ke Lintasdbapp1! Error: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			fmt.Fprintf(w, "❌ test-app gagal konek ke DB di 10.192.15.6: %v", err)
 			return
 		}
-		fmt.Fprint(w, "Status: Berhasil Terhubung ke PostgreSQL di 10.192.15.6")
+		fmt.Fprint(w, "✅ test-app berhasil koneksi ke PostgreSQL Lintasdbapp1!")
 	})
 
-	log.Println("Aplikasi berjalan di port 8080...")
+	log.Println("test-app start on port 8080...")
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
