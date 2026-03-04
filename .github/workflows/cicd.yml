@@ -26,47 +26,41 @@ jobs:
           docker build -t test-app:latest .
           docker save test-app:latest -o test-app.tar
 
-      - name: Connect to WireGuard (Manual Clean Version)
+      - name: Connect to WireGuard (Ultra Clean Version)
+        shell: bash
         env:
-          # Memasukkan secret ke env agar shell tidak merusak formatnya
-          RAW_WG_PRIVATE_KEY: ${{ secrets.WG_PRIVATE_KEY }}
-          RAW_WG_SERVER_PUBKEY: ${{ secrets.WG_SERVER_PUBLIC_KEY }}
-          RAW_WG_ENDPOINT: ${{ secrets.WG_ENDPOINT }}
+          # Menggunakan variabel shell murni untuk menghindari interpolasi tanda petik
+          PRIVATE_KEY_VAL: ${{ secrets.WG_PRIVATE_KEY }}
+          SERVER_PUBKEY_VAL: ${{ secrets.WG_SERVER_PUBLIC_KEY }}
+          ENDPOINT_VAL: ${{ secrets.WG_ENDPOINT }}
         run: |
           sudo apt-get update && sudo apt-get install -y wireguard
           
-          # Hapus semua karakter yang BUKAN karakter Base64 (A-Z, a-z, 0-9, +, /, =)
-          # Ini akan membersihkan tanda petik, spasi, atau newline yang nyelip
-          CLEAN_PRIVATE=$(echo -n "$RAW_WG_PRIVATE_KEY" | tr -dc 'A-Za-z0-9+/=')
-          CLEAN_PUBKEY=$(echo -n "$RAW_WG_SERVER_PUBKEY" | tr -dc 'A-Za-z0-9+/=')
-          CLEAN_ENDPOINT=$(echo -n "$RAW_WG_ENDPOINT" | tr -d '\n' | tr -d ' ' | tr -d "'")
-          
+          # Gunakan python untuk membersihkan semua karakter non-base64 secara absolut
+          CLEAN_PRIVATE=$(python3 -c "import re; print(re.sub(r'[^A-Za-z0-9+/=]', '', '''$PRIVATE_KEY_VAL'''))")
+          CLEAN_PUBKEY=$(python3 -c "import re; print(re.sub(r'[^A-Za-z0-9+/=]', '', '''$SERVER_PUBKEY_VAL'''))")
+          CLEAN_ENDPOINT=$(python3 -c "import re; print(re.sub(r'[^0-9a-zA-Z.:-]', '', '''$ENDPOINT_VAL'''))")
+
           echo -n "$CLEAN_PRIVATE" > private.key
           chmod 600 private.key
           
-          # Inisialisasi interface wg0
           sudo ip link add dev wg0 type wireguard
-          
-          # Set IP Runner yang sudah kamu tentukan
           sudo ip addr add 10.192.15.20/24 dev wg0
           
-          # Konfigurasi Peer menggunakan key yang sudah dibersihkan
           sudo wg set wg0 private-key ./private.key \
             peer "$CLEAN_PUBKEY" \
             endpoint "$CLEAN_ENDPOINT" \
             allowed-ips 10.192.15.0/24 \
             persistent-keepalive 25
           
-          # Aktifkan interface
           sudo ip link set up dev wg0
-          
-          # Tunggu handshake & verifikasi
           sleep 10
+          
           echo "📊 WireGuard Status:"
           sudo wg show
           
-          echo "🔍 Testing Connection to Master (10.192.15.2)..."
-          ping -c 3 10.192.15.2 || (echo "❌ VPN Aktif tapi Master 10.192.15.2 Tidak Respon!" && exit 1)
+          echo "🔍 Testing Connection to Master..."
+          ping -c 3 10.192.15.2 || (echo "❌ Koneksi Gagal!" && exit 1)
 
       - name: Setup SSH Key with Passphrase
         run: |
@@ -99,5 +93,3 @@ jobs:
           echo "🚀 Sending to Worker (10.192.15.5) via Master..."
           scp -J devops@10.192.15.2 test-app.tar adminlintas@10.192.15.5:~/test-app.tar
           ssh -J devops@10.192.15.2 adminlintas@10.192.15.5 "docker load -i ~/test-app.tar && rm ~/test-app.tar"
-          
-          echo "✅ Deployment Sukses!"
