@@ -2,4 +2,7 @@ module test-app
 
 go 1.21
 
-require ://github.com v1.10.9
+require (
+	github.com/google/uuid v1.3.0
+	// other dependencies...
+)
