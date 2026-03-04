@@ -1,11 +1,11 @@
-name: CI/CD Deploy to Kubernetes via WireGuard
+name: CI/CD K8s Deploy - No Base64 Mode
 
 on:
   push:
     branches: [ main ]
 
 jobs:
-  build-and-deploy-k8s:
+  build-and-deploy:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code
@@ -15,14 +15,14 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: '1.22'
-      
+
       - name: Build Docker Image
         run: |
-          # Kita tetap build untuk memastikan kode aman
           docker build -t test-app:latest .
-          # Jika pakai Registry, step 'docker push' ada di sini
+          # Kita simpan tar jika kamu masih ingin load manual ke Node K8s
+          docker save test-app:latest -o test-app.tar
 
-      - name: Connect to WireGuard
+      - name: Connect to WireGuard (Clean Mode)
         shell: bash
         env:
           WG_PRIV: ${{ secrets.WG_PRIVATE_KEY }}
@@ -32,6 +32,7 @@ jobs:
           sudo apt-get update && sudo apt-get install -y wireguard
           CLEAN_PRIV=$(echo -n "$WG_PRIV" | tr -dc 'A-Za-z0-9+/=')
           printf "%s" "$CLEAN_PRIV" > private.key
+          chmod 600 private.key
           sudo ip link add dev wg0 type wireguard
           sudo ip addr add 10.192.15.20/24 dev wg0
           sudo wg set wg0 private-key ./private.key peer "$WG_PUB" endpoint "$WG_END" allowed-ips 10.192.15.0/24
@@ -39,32 +40,41 @@ jobs:
           sleep 5
           ping -c 3 10.192.15.2
 
-      - name: Setup SSH (Base64 Mode)
+      - name: Setup SSH Key (Fixed Format No-Base64)
         run: |
           mkdir -p ~/.ssh
-          echo "${{ secrets.SSH_PRIVATE_KEY }}" | base64 -d > ~/.ssh/id_rsa
+          # Menggunakan 'EOF' dengan kutip agar variable tidak di-expand/rusak
+          cat <<'EOF' > ~/.ssh/id_rsa
+          ${{ secrets.SSH_PRIVATE_KEY }}
+          EOF
+          
           chmod 600 ~/.ssh/id_rsa
+          
+          # Setup bypass passphrase
           echo "echo '${{ secrets.SSH_PASSPHRASE }}'" > ~/.ssh/passphrase.sh
           chmod +x ~/.ssh/passphrase.sh
+          
           cat <<EOF > ~/.ssh/config
           Host *
             StrictHostKeyChecking no
+            UserKnownHostsFile /dev/null
             AddKeysToAgent yes
           EOF
+
           eval $(ssh-agent -s)
           DISPLAY=:0 SSH_ASKPASS=~/.ssh/passphrase.sh setsid ssh-add ~/.ssh/id_rsa < /dev/null
           echo "SSH_AUTH_SOCK=$SSH_AUTH_SOCK" >> $GITHUB_ENV
 
-      - name: K8s Deployment via SSH
+      - name: Deploy to Kubernetes via Master
         run: |
-          # Kita perintahkan Master (Control Plane) untuk rollout restart atau apply manifest
-          echo "🚀 Triggering K8s Deployment on Master..."
+          # 1. Kirim image ke Master (jika node K8s ada di sana)
+          echo "🚀 Transferring image to Master..."
+          scp test-app.tar devops@10.192.15.2:~/test-app.tar
+          ssh devops@10.192.15.2 "docker load -i ~/test-app.tar && rm ~/test-app.tar"
           
-          # Opsi A: Jika manifest sudah ada di server Master
-          ssh devops@10.192.15.2 "kubectl rollout restart deployment/test-app-deployment"
+          # 2. Update Kubernetes (Rollout)
+          # Asumsi manifest sudah ada di server atau menggunakan kubectl apply
+          echo "🚀 Restarting K8s Deployment..."
+          ssh devops@10.192.15.2 "kubectl rollout restart deployment/test-app"
           
-          # Opsi B: Jika ingin kirim manifest baru dari GitHub
-          # scp deployment.yaml devops@10.192.15.2:~/deployment.yaml
-          # ssh devops@10.192.15.2 "kubectl apply -f ~/deployment.yaml"
-
-          echo "✅ Kubernetes updated!"
+          echo "✅ Deployment K8s Selesai!"
