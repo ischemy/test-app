@@ -1,4 +1,4 @@
-name: CI/CD K8s Deploy via Jumphost
+name: CI/CD K8s Deploy Estafet Mode
 
 on:
   push:
@@ -37,60 +37,67 @@ jobs:
           sudo wg set wg0 private-key ./private.key peer "$WG_PUB" endpoint "$WG_END" allowed-ips 10.192.15.0/24
           sudo ip link set up dev wg0
           sleep 5
+          ping -c 3 10.192.15.2
 
-      - name: Setup SSH Config for Jumphost
+      - name: Setup SSH (Fixed Format)
         run: |
           mkdir -p ~/.ssh
-          # Tulis Private Key (Tanpa Base64, pakai cat <<'EOF')
           cat <<'EOF' > ~/.ssh/id_rsa
           ${{ secrets.SSH_PRIVATE_KEY }}
           EOF
           chmod 600 ~/.ssh/id_rsa
           
-          # Konfigurasi SSH: Masuk ke 10.192.15.5 WAJIB lewat devops@10.192.15.2
-          cat <<EOF > ~/.ssh/config
-          Host jumphost
-            HostName 10.192.15.2
-            User devops
-            StrictHostKeyChecking no
-
-          Host worker
-            HostName 10.192.15.5
-            User adminlintas
-            ProxyJump jumphost
-            StrictHostKeyChecking no
-          EOF
-
-          # Jalankan SSH Agent untuk handle Passphrase (jika ada)
-          eval $(ssh-agent -s)
           echo "echo '${{ secrets.SSH_PASSPHRASE }}'" > ~/.ssh/passphrase.sh
           chmod +x ~/.ssh/passphrase.sh
-          DISPLAY=:0 SSH_ASKPASS=~/.ssh/passphrase.sh setsid ssh-add ~/.ssh/id_rsa < /dev/null
           
+          cat <<EOF > ~/.ssh/config
+          Host *
+            StrictHostKeyChecking no
+            UserKnownHostsFile /dev/null
+            AddKeysToAgent yes
+          EOF
+
+          eval $(ssh-agent -s)
+          DISPLAY=:0 SSH_ASKPASS=~/.ssh/passphrase.sh setsid ssh-add ~/.ssh/id_rsa < /dev/null
           echo "SSH_AUTH_SOCK=$SSH_AUTH_SOCK" >> $GITHUB_ENV
-          echo "SSH_AGENT_PID=$SSH_AGENT_PID" >> $GITHUB_ENV
 
-      - name: Deploy to K8s Nodes
+      - name: Deploy via Master Estafet
         run: |
-          # 1. Load ke Jumphost/Master (10.192.15.2)
-          echo "🚀 Sending image to Jumphost..."
-          scp test-app.tar deployment.yaml jumphost:~/
-          ssh jumphost "docker load -i ~/test-app.tar && rm ~/test-app.tar"
-
-          # 2. Load ke Worker (10.192.15.5) otomatis lewat Jumphost
-          echo "🚀 Sending image to Worker via Jumphost..."
-          scp test-app.tar worker:~/
-          ssh worker "docker load -i ~/test-app.tar && rm ~/test-app.tar"
-
-          # 3. Eksekusi K8s Command di Master
-          echo "🚀 Updating K8s Secrets and Deployment..."
-          ssh jumphost "kubectl create secret generic db-secret \
-            --from-literal=DB_HOST='${{ secrets.DB_HOST }}' \
-            --from-literal=DB_USER='${{ secrets.DB_USER }}' \
-            --from-literal=DB_PASSWORD='${{ secrets.DB_PASSWORD }}' \
-            --from-literal=DB_NAME='${{ secrets.DB_NAME }}' \
-            --dry-run=client -o yaml | kubectl apply -f - && \
-            kubectl apply -f ~/deployment.yaml && \
-            kubectl rollout restart deployment/test-app-deployment"
-
-          echo "✅ DEPLOYMENT FINISHED!"
+          # 1. Kirim Image, Manifest, dan Kunci SSH ke Master
+          echo "🚀 Sending files and temporary key to Master..."
+          scp test-app.tar deployment.yaml ~/.ssh/id_rsa devops@10.192.15.2:~/
+          
+          # 2. Eksekusi Berantai di dalam Master
+          ssh devops@10.192.15.2 "
+            set -e
+            # Load image di Master
+            echo '📦 Loading image on Master...'
+            docker load -i ~/test-app.tar
+            
+            # Setup kunci SSH sementara di Master agar bisa tembus ke Worker
+            chmod 600 ~/id_rsa
+            
+            # Kirim Image dari Master ke Worker
+            echo '🚀 Sending image from Master to Worker (10.192.15.5)...'
+            scp -i ~/id_rsa -o StrictHostKeyChecking=no ~/test-app.tar adminlintas@10.192.15.5:~/
+            
+            # Load Image di Worker
+            echo '📦 Loading image on Worker...'
+            ssh -i ~/id_rsa -o StrictHostKeyChecking=no adminlintas@10.192.15.5 'docker load -i ~/test-app.tar && rm ~/test-app.tar'
+            
+            # 3. K8s Deploy (Create Secret & Apply Manifest)
+            echo '🏗️ Updating Kubernetes Resources...'
+            kubectl create secret generic db-secret \
+              --from-literal=DB_HOST='${{ secrets.DB_HOST }}' \
+              --from-literal=DB_USER='${{ secrets.DB_USER }}' \
+              --from-literal=DB_PASSWORD='${{ secrets.DB_PASSWORD }}' \
+              --from-literal=DB_NAME='${{ secrets.DB_NAME }}' \
+              --dry-run=client -o yaml | kubectl apply -f -
+            
+            kubectl apply -f ~/deployment.yaml
+            kubectl rollout restart deployment/test-app-deployment
+            
+            # Bersihkan file sampah di Master setelah selesai
+            rm ~/id_rsa ~/test-app.tar ~/deployment.yaml
+            echo '✅ Deployment Process Finished Successfully!'
+          "
