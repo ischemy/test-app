@@ -1,51 +1,61 @@
-
-name: Deploy test-app via WireGuard
+name: CI/CD test-app Biznet VPN
 
 on:
   push:
     branches: [ main ]
 
 jobs:
-  build-and-deploy:
+  deploy:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # 1. BANGUN TUNNEL VPN (Agar GitHub bisa melihat 10.192.15.x)
-      - name: Connect WireGuard VPN
+      # 1. SETUP VPN WIREGUARD
+      - name: Install & Connect WireGuard
         run: |
           sudo apt-get update && sudo apt-get install -y wireguard
           echo "${{ secrets.WG_CONFIG }}" > wg0.conf
           sudo wg-quick up ./wg0.conf
+          # Tunggu handshake VPN stabil
+          sleep 5
+          # Verifikasi jalur ke Master & DB
+          ping -c 2 10.192.15.4
+          ping -c 2 10.192.15.6
 
-      # 2. SETUP SSH KEY (Untuk scp & ssh ke node internal)
-      - name: Setup SSH
+      # 2. SETUP SSH ACCESS
+      - name: Setup SSH Key
         run: |
           mkdir -p ~/.ssh
           echo "${{ secrets.SSH_KEY }}" > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
-          # Daftarkan host agar tidak muncul prompt (StrictHostKeyChecking)
+          # Scan host via jalur VPN agar tidak ditanya fingerprint (Yes/No)
           ssh-keyscan -H 10.192.15.4 10.192.15.5 >> ~/.ssh/known_hosts
 
-      # 3. BUILD & EXPORT IMAGE (Sesuai tahap Jenkins Anda)
-      - name: Build and Export Image
+      # 3. BUILD & EXPORT IMAGE (64-bit Alpine)
+      - name: Build and Export Docker Image
         run: |
           docker build -t test-app:local .
           docker save test-app:local -o test-app.tar
 
-      # 4. SECURE REMOTE DEPLOY (Sesuai logika script Jenkins Anda)
-      - name: Deploy to Biznet Nodes
+      # 4. TRANSFER & DEPLOY (Kirim via SCP VPN)
+      - name: Remote Deploy to Biznet Nodes
         run: |
-          # Loop untuk kirim ke lintaskubeapp1 & lintaskubeapp2
-          for node in 10.192.15.4 10.192.15.5; do
-            echo "Deploying to adminlintas@$node..."
+          # Node list sesuai environment Anda
+          NODES="10.192.15.4 10.192.15.5"
+          
+          for ip in $NODES; do
+            echo "------------------------------------------"
+            echo "Deploying to adminlintas@$ip..."
             
-            # Kirim file .tar dan docker-compose.yml via VPN
-            scp test-app.tar docker-compose.yml adminlintas@$node:~/test-app/
+            # Buat direktori jika belum ada
+            ssh adminlintas@$ip "mkdir -p ~/test-app"
             
-            # Load image dan jalankan container dengan Secrets
-            ssh adminlintas@$node "
+            # Kirim file .tar dan docker-compose.yml
+            scp test-app.tar docker-compose.yml adminlintas@$ip:~/test-app/
+            
+            # Load image dan jalankan (Injeksi Secrets langsung)
+            ssh adminlintas@$ip "
                 cd ~/test-app && \
                 docker load -i test-app.tar && \
                 DB_HOST='${{ secrets.DB_HOST }}' \
@@ -57,7 +67,7 @@ jobs:
             "
           done
 
-      # 5. BERSIHKAN VPN
+      # 5. DISCONNECT VPN (Cleanup)
       - name: Disconnect VPN
         if: always()
         run: sudo wg-quick down ./wg0.conf
