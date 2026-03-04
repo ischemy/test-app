@@ -31,6 +31,7 @@ jobs:
         with:
           # Pastikan secret ini berisi PRIVATE KEY lengkap (Begin & End)
           ssh-private-key: ${{ secrets.SSH_KEY }}
+          ssh-passphrase: ${{ secrets.SSH_PASSPHRASE }}
 
       - name: Deploy to Servers
         run: |
