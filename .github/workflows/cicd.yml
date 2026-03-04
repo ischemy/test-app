@@ -1,84 +1,49 @@
-name: Biznet K8s Master-Jumphost Deploy
+name: CI/CD Test App Deploy
 
 on:
   push:
     branches: [ main ]
 
 jobs:
-  deploy:
+  build-and-transfer:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # 1. CONNECT VPN (Langsung ke Master/Jumphost)
-      - name: Connect WireGuard VPN
-        run: |
-          sudo apt-get update && sudo apt-get install -y wireguard
-          echo "${{ secrets.WG_CONFIG }}" > wg0.conf
-          chmod 600 wg0.conf
-          sudo wg-quick up ./wg0.conf
-          sleep 5
-          # Verifikasi koneksi ke Master (Dirinya sendiri di network VPN)
-          ping -c 3 10.192.15.2
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22' # Sesuaikan dengan versi di go.mod kamu
 
-      # 2. SETUP SSH ACCESS
-      - name: Setup SSH Key
+      - name: Prepare Dependencies
         run: |
-          mkdir -p ~/.ssh
-          echo "${{ secrets.SSH_KEY }}" > ~/.ssh/id_rsa
-          chmod 600 ~/.ssh/id_rsa
-          # Scan Master & Worker via jalur VPN
-          ssh-keyscan -H 10.192.15.2 10.192.15.5 10.192.15.6 >> ~/.ssh/known_hosts
+          go mod tidy
+          go mod download
 
-      # 3. BUILD & EXPORT IMAGE
-      - name: Build and Export Image
+      - name: Build Docker Image
         run: |
           docker build -t test-app:latest .
           docker save test-app:latest -o test-app.tar
 
-      # 4. DISTRIBUSI IMAGE (Internal via VPN)
-      - name: Load Image to Cluster
-        run: |
-          # A. Load di Master (10.192.15.2)
-          scp test-app.tar devops@10.192.15.2:~/test-app.tar
-          ssh devops@10.192.15.2 "docker load -i ~/test-app.tar && rm ~/test-app.tar"
-          
-          # B. Load di Worker (10.192.15.5) LOMPAT lewat Master
-          # Gunakan ProxyJump (-J) karena Master adalah Jumphost
-          scp -J devops@10.192.15.2 test-app.tar adminlintas@10.192.15.5:~/test-app.tar
-          ssh -J devops@10.192.15.2 adminlintas@10.192.15.5 "docker load -i ~/test-app.tar && rm ~/test-app.tar"
+      - name: Setup SSH Agent
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          # Pastikan secret ini berisi PRIVATE KEY lengkap (Begin & End)
+          ssh-private-key: ${{ secrets.SSH_KEY }}
 
-      # 5. KUBERNETES APPLY (Di Master Node)
-      - name: K8s Apply via Master
+      - name: Deploy to Servers
         run: |
-          ssh devops@10.192.15.2 "kubectl apply -f - <<EOF
-          apiVersion: apps/v1
-          kind: Deployment
-          metadata:
-            name: test-app
-          spec:
-            replicas: 2
-            selector:
-              matchLabels:
-                app: test-app
-            template:
-              metadata:
-                labels:
-                  app: test-app
-              spec:
-                containers:
-                - name: test-app
-                  image: test-app:latest
-                  imagePullPolicy: Never
-                  env:
-                  - name: DB_HOST
-                    value: '10.192.15.6'
-                  - name: DB_USER
-                    value: 'user_testapp'
-                  - name: DB_PASSWORD
-                    value: '${{ secrets.DB_PASSWORD }}'
-                  - name: DB_NAME
-                    value: 'db_testapp'
-          EOF
-          "
+          # Opsi SSH agar tidak minta konfirmasi fingerprint (YES/NO)
+          SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+          
+          echo "🚀 Uploading to Master (10.192.15.2)..."
+          scp $SSH_OPTS test-app.tar devops@10.192.15.2:~/test-app.tar
+          ssh $SSH_OPTS devops@10.192.15.2 "docker load -i ~/test-app.tar && rm ~/test-app.tar"
+          
+          echo "🚀 Uploading to Worker (10.192.15.5) via Master..."
+          # ProxyJump (-J) menggunakan user devops di master untuk lompat ke adminlintas di worker
+          scp $SSH_OPTS -J devops@10.192.15.2 test-app.tar adminlintas@10.192.15.5:~/test-app.tar
+          ssh $SSH_OPTS -J devops@10.192.15.2 adminlintas@10.192.15.5 "docker load -i ~/test-app.tar && rm ~/test-app.tar"
+          
+          echo "✅ Deployment Selesai!"
