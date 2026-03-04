@@ -30,9 +30,12 @@ jobs:
         run: |
           sudo apt-get update && sudo apt-get install -y wireguard
           
-          # Buat file private key dari secret
-          echo "${{ secrets.WG_PRIVATE_KEY }}" > private.key
+          # Membersihkan Key dari karakter aneh/newline yang terbawa dari GitHub Secrets
+          echo -n "${{ secrets.WG_PRIVATE_KEY }}" | tr -d '\n' | tr -d ' ' > private.key
           chmod 600 private.key
+          
+          SERVER_PUBKEY=$(echo -n "${{ secrets.WG_SERVER_PUBLIC_KEY }}" | tr -d '\n' | tr -d ' ')
+          WG_ENDPOINT=$(echo -n "${{ secrets.WG_ENDPOINT }}" | tr -d '\n' | tr -d ' ')
           
           # Inisialisasi interface wg0
           sudo ip link add dev wg0 type wireguard
@@ -42,21 +45,21 @@ jobs:
           
           # Konfigurasi Peer ke Server VPN
           sudo wg set wg0 private-key ./private.key \
-            peer ${{ secrets.WG_SERVER_PUBLIC_KEY }} \
-            endpoint ${{ secrets.WG_ENDPOINT }} \
+            peer "$SERVER_PUBKEY" \
+            endpoint "$WG_ENDPOINT" \
             allowed-ips 10.192.15.0/24 \
             persistent-keepalive 25
           
           # Aktifkan interface
           sudo ip link set up dev wg0
           
-          # Tunggu handshake sebentar
+          # Tunggu handshake & verifikasi
           sleep 10
-          
-          # Verifikasi koneksi ke Master
-          echo "🔍 Verifikasi Koneksi ke Master..."
+          echo "📊 WireGuard Status:"
           sudo wg show
-          ping -c 3 10.192.15.2 || (echo "❌ Ping Gagal! Cek konfigurasi Peer di server Master" && exit 1)
+          
+          echo "🔍 Testing Connection to Master (10.192.15.2)..."
+          ping -c 3 10.192.15.2 || (echo "❌ VPN Terhubung tapi Master tidak merespon!" && exit 1)
 
       - name: Setup SSH Key with Passphrase
         run: |
@@ -64,7 +67,6 @@ jobs:
           echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
           
-          # Helper script untuk input passphrase SSH otomatis
           echo 'echo "${{ secrets.SSH_PASSPHRASE }}"' > ~/.ssh/passphrase.sh
           chmod +x ~/.ssh/passphrase.sh
           
@@ -75,23 +77,20 @@ jobs:
             AddKeysToAgent yes
           EOF
 
-          # Jalankan SSH Agent dan inject key
           eval $(ssh-agent -s)
           DISPLAY=:0 SSH_ASKPASS=~/.ssh/passphrase.sh setsid ssh-add ~/.ssh/id_rsa < /dev/null
           
-          # Simpan env agar terbaca di step berikutnya
           echo "SSH_AUTH_SOCK=$SSH_AUTH_SOCK" >> $GITHUB_ENV
           echo "SSH_AGENT_PID=$SSH_AGENT_PID" >> $GITHUB_ENV
 
       - name: Transfer and Load Image
         run: |
-          # Step ini sekarang berjalan lewat tunnel WireGuard
-          echo "🚀 Mengirim ke Master (10.192.15.2)..."
+          echo "🚀 Sending to Master (10.192.15.2)..."
           scp test-app.tar devops@10.192.15.2:~/test-app.tar
           ssh devops@10.192.15.2 "docker load -i ~/test-app.tar && rm ~/test-app.tar"
           
-          echo "🚀 Mengirim ke Worker (10.192.15.5) via Master..."
+          echo "🚀 Sending to Worker (10.192.15.5) via Master..."
           scp -J devops@10.192.15.2 test-app.tar adminlintas@10.192.15.5:~/test-app.tar
           ssh -J devops@10.192.15.2 adminlintas@10.192.15.5 "docker load -i ~/test-app.tar && rm ~/test-app.tar"
           
-          echo "✅ Deployment Sukses ke Master dan Worker!"
+          echo "✅ Deployment Sukses!"
