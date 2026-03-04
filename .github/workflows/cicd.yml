@@ -1,4 +1,4 @@
-name: Biznet 64bit K8s VPN Deploy
+name: Biznet K8s Master-Jumphost Deploy
 
 on:
   push:
@@ -11,53 +11,48 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # 1. SETUP VPN (Menembus Biznet GIO via Port UDP 51820)
+      # 1. CONNECT VPN (Langsung ke Master/Jumphost)
       - name: Connect WireGuard VPN
         run: |
           sudo apt-get update && sudo apt-get install -y wireguard
           echo "${{ secrets.WG_CONFIG }}" > wg0.conf
           chmod 600 wg0.conf
           sudo wg-quick up ./wg0.conf
-          # Tunggu handshake & verifikasi jalur internal
           sleep 5
-          ping -c 2 10.192.15.4 # Ping Master (Jumphost)
-          ping -c 2 10.192.15.6 # Ping Database
+          # Verifikasi koneksi ke Master (Dirinya sendiri di network VPN)
+          ping -c 3 10.192.15.2
 
-      # 2. SETUP SSH ACCESS (Kunci untuk Master & Worker)
+      # 2. SETUP SSH ACCESS
       - name: Setup SSH Key
         run: |
           mkdir -p ~/.ssh
           echo "${{ secrets.SSH_KEY }}" > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
-          # Daftarkan fingerprint semua node internal agar tidak interaktif
-          ssh-keyscan -H 10.192.15.4 10.192.15.5 10.192.15.6 >> ~/.ssh/known_hosts
+          # Scan Master & Worker via jalur VPN
+          ssh-keyscan -H 10.192.15.2 10.192.15.5 10.192.15.6 >> ~/.ssh/known_hosts
 
-      # 3. BUILD & EXPORT DOCKER IMAGE
+      # 3. BUILD & EXPORT IMAGE
       - name: Build and Export Image
         run: |
           docker build -t test-app:latest .
           docker save test-app:latest -o test-app.tar
 
-      # 4. TRANSFER IMAGE VIA JUMPHOST (Master Node)
-      - name: Transfer Image to Cluster
+      # 4. DISTRIBUSI IMAGE (Internal via VPN)
+      - name: Load Image to Cluster
         run: |
-          # A. Kirim ke Master Node (Jumphost)
-          ssh adminlintas@10.192.15.4 "mkdir -p ~/test-app"
-          scp test-app.tar adminlintas@10.192.15.4:~/test-app/
+          # A. Load di Master (10.192.15.2)
+          scp test-app.tar devops@10.192.15.2:~/test-app.tar
+          ssh devops@10.192.15.2 "docker load -i ~/test-app.tar && rm ~/test-app.tar"
           
-          # B. Kirim ke Worker Node LOMPAT lewat Master (ProxyJump)
-          ssh -J adminlintas@10.192.15.4 adminlintas@10.192.15.5 "mkdir -p ~/test-app"
-          scp -J adminlintas@10.192.15.4 test-app.tar adminlintas@10.192.15.5:~/test-app/
+          # B. Load di Worker (10.192.15.5) LOMPAT lewat Master
+          # Gunakan ProxyJump (-J) karena Master adalah Jumphost
+          scp -J devops@10.192.15.2 test-app.tar adminlintas@10.192.15.5:~/test-app.tar
+          ssh -J devops@10.192.15.2 adminlintas@10.192.15.5 "docker load -i ~/test-app.tar && rm ~/test-app.tar"
 
-      # 5. LOAD IMAGE & DEPLOY KUBERNETES
-      - name: Load Image and Apply K8s
+      # 5. KUBERNETES APPLY (Di Master Node)
+      - name: K8s Apply via Master
         run: |
-          # Load image di semua node agar pod bisa Running (imagePullPolicy: Never)
-          ssh adminlintas@10.192.15.4 "docker load -i ~/test-app/test-app.tar && rm ~/test-app/test-app.tar"
-          ssh -J adminlintas@10.192.15.4 adminlintas@10.192.15.5 "docker load -i ~/test-app/test-app.tar && rm ~/test-app/test-app.tar"
-          
-          # Eksekusi Manifest Deployment di Master
-          ssh adminlintas@10.192.15.4 "kubectl apply -f - <<EOF
+          ssh devops@10.192.15.2 "kubectl apply -f - <<EOF
           apiVersion: apps/v1
           kind: Deployment
           metadata:
@@ -76,8 +71,6 @@ jobs:
                 - name: test-app
                   image: test-app:latest
                   imagePullPolicy: Never
-                  ports:
-                  - containerPort: 8080
                   env:
                   - name: DB_HOST
                     value: '10.192.15.6'
@@ -87,23 +80,5 @@ jobs:
                     value: '${{ secrets.DB_PASSWORD }}'
                   - name: DB_NAME
                     value: 'db_testapp'
-          ---
-          apiVersion: v1
-          kind: Service
-          metadata:
-            name: test-app-service
-          spec:
-            type: NodePort
-            selector:
-              app: test-app
-            ports:
-            - port: 80
-              targetPort: 8080
-              nodePort: 30080
           EOF
           "
-
-      # 6. CLEANUP VPN
-      - name: Disconnect VPN
-        if: always()
-        run: sudo wg-quick down ./wg0.conf
