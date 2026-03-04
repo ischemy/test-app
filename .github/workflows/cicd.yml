@@ -1,4 +1,4 @@
-name: CI/CD Deploy App Final - WireGuard Safe Mode
+name: CI/CD Deploy App Final - Ultra Stable
 
 on:
   push:
@@ -26,31 +26,29 @@ jobs:
           docker build -t test-app:latest .
           docker save test-app:latest -o test-app.tar
 
-      - name: Connect to WireGuard (Base64 Safe Mode)
+      - name: Connect to WireGuard (Safe Clean Mode)
         shell: bash
         env:
-          # Kita ambil mentah-mentah dari secret
           WG_PRIV: ${{ secrets.WG_PRIVATE_KEY }}
           WG_PUB: ${{ secrets.WG_SERVER_PUBLIC_KEY }}
           WG_END: ${{ secrets.WG_ENDPOINT }}
         run: |
           sudo apt-get update && sudo apt-get install -y wireguard
           
-          # TRICK: Kita hapus semua karakter yang BUKAN karakter Base64 (A-Z, a-z, 0-9, +, /, =)
-          # Ini akan membuang tanda petik (') secara paksa jika ada yang nyelip
+          # Membersihkan Key dari karakter liar (kutip, spasi, newline)
+          # tr -dc 'A-Za-z0-9+/=' akan membuang tanda petik secara paksa
           CLEAN_PRIV=$(echo -n "$WG_PRIV" | tr -dc 'A-Za-z0-9+/=')
           CLEAN_PUB=$(echo -n "$WG_PUB" | tr -dc 'A-Za-z0-9+/=')
           CLEAN_END=$(echo -n "$WG_END" | tr -d '\n' | tr -d ' ' | tr -d "'")
 
-          # Simpan ke file tanpa echo (pakai printf agar lebih steril)
+          # Simpan private key ke file secara aman
           printf "%s" "$CLEAN_PRIV" > private.key
           chmod 600 private.key
           
-          # Tambahkan interface
+          # Setup interface WireGuard
           sudo ip link add dev wg0 type wireguard
           sudo ip addr add 10.192.15.20/24 dev wg0
           
-          # Set konfigurasi menggunakan file private.key
           sudo wg set wg0 private-key ./private.key \
             peer "$CLEAN_PUB" \
             endpoint "$CLEAN_END" \
@@ -58,20 +56,27 @@ jobs:
             persistent-keepalive 25
           
           sudo ip link set up dev wg0
-          sleep 10
           
-          echo "📊 Status VPN:"
+          # Tunggu koneksi stabil
+          sleep 10
+          echo "📊 WireGuard Status:"
           sudo wg show
           
-          echo "🔍 Ping Master (10.192.15.2)..."
-          ping -c 3 10.192.15.2 || (echo "❌ VPN Gagal Terhubung ke Master!" && exit 1)
+          echo "🔍 Testing Ping ke Master (10.192.15.2)..."
+          ping -c 3 10.192.15.2 || (echo "❌ VPN Gagal Konek ke Master!" && exit 1)
 
-      - name: Setup SSH Key with Passphrase
+      - name: Setup SSH Key (Fixed Format)
         run: |
           mkdir -p ~/.ssh
-          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          
+          # Gunakan cat <<EOF agar format baris baru dari Secret tetap terjaga sempurna
+          cat <<EOF > ~/.ssh/id_rsa
+          ${{ secrets.SSH_PRIVATE_KEY }}
+          EOF
+          
           chmod 600 ~/.ssh/id_rsa
           
+          # Script bypass passphrase otomatis
           echo 'echo "${{ secrets.SSH_PASSPHRASE }}"' > ~/.ssh/passphrase.sh
           chmod +x ~/.ssh/passphrase.sh
           
@@ -82,21 +87,24 @@ jobs:
             AddKeysToAgent yes
           EOF
 
+          # Jalankan SSH Agent
           eval $(ssh-agent -s)
+          # Inject key menggunakan passphrase otomatis
           DISPLAY=:0 SSH_ASKPASS=~/.ssh/passphrase.sh setsid ssh-add ~/.ssh/id_rsa < /dev/null
           
+          # Simpan env agar terbaca di step berikutnya
           echo "SSH_AUTH_SOCK=$SSH_AUTH_SOCK" >> $GITHUB_ENV
           echo "SSH_AGENT_PID=$SSH_AGENT_PID" >> $GITHUB_ENV
 
       - name: Transfer and Load Image to Master & Worker
         run: |
-          # Deploy ke Master
-          echo "🚀 Mengirim image ke Master (10.192.15.2)..."
+          # 1. Deploy ke Master (10.192.15.2)
+          echo "🚀 Mengirim image ke Master..."
           scp test-app.tar devops@10.192.15.2:~/test-app.tar
           ssh devops@10.192.15.2 "docker load -i ~/test-app.tar && rm ~/test-app.tar"
           
-          # Deploy ke Worker via Master (ProxyJump)
-          echo "🚀 Mengirim image ke Worker (10.192.15.5) via Master..."
+          # 2. Deploy ke Worker (10.192.15.5) LOMPAT lewat Master
+          echo "🚀 Mengirim image ke Worker via Master..."
           scp -J devops@10.192.15.2 test-app.tar adminlintas@10.192.15.5:~/test-app.tar
           ssh -J devops@10.192.15.2 adminlintas@10.192.15.5 "docker load -i ~/test-app.tar && rm ~/test-app.tar"
           
