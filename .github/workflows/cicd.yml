@@ -1,11 +1,11 @@
-name: CI/CD Test App Deploy
+name: CI/CD Deploy App via WireGuard
 
 on:
   push:
     branches: [ main ]
 
 jobs:
-  build-and-transfer:
+  build-and-deploy:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code
@@ -14,9 +14,9 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.22' # Sesuaikan dengan versi di go.mod kamu
+          go-version: '1.22'
 
-      - name: Prepare Dependencies
+      - name: Prepare Go Modules
         run: |
           go mod tidy
           go mod download
@@ -26,25 +26,52 @@ jobs:
           docker build -t test-app:latest .
           docker save test-app:latest -o test-app.tar
 
-      - name: Setup SSH Agent
-        uses: webfactory/ssh-agent@v0.9.0
+      - name: Connect to WireGuard
+        uses: egor-tensin/setup-wireguard@v1
         with:
-          # Pastikan secret ini berisi PRIVATE KEY lengkap (Begin & End)
-          ssh-private-key: ${{ secrets.SSH_KEY }}
-          ssh-passphrase: ${{ secrets.SSH_PASSPHRASE }}
+          # IP & Port Publik Server WireGuard kamu (misal: 202.x.x.x:51820)
+          endpoint: '${{ secrets.WG_ENDPOINT }}'
+          endpoint_public_key: '${{ secrets.WG_SERVER_PUBLIC_KEY }}'
+          # IP yang diberikan untuk Runner ini di dalam VPN (misal: 10.192.15.100/24)
+          ips: '${{ secrets.WG_RUNNER_IP }}'
+          # Range IP yang ingin diakses melalui tunnel ini
+          allowed_ips: '10.192.15.0/24'
+          # Private Key milik "Peer" GitHub Runner (bukan punya server)
+          private_key: '${{ secrets.WG_PRIVATE_KEY }}'
 
-      - name: Deploy to Servers
+      - name: Setup SSH Key with Passphrase
         run: |
-          # Opsi SSH agar tidak minta konfirmasi fingerprint (YES/NO)
-          SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
           
-          echo "🚀 Uploading to Master (10.192.15.2)..."
-          scp $SSH_OPTS test-app.tar devops@10.192.15.2:~/test-app.tar
-          ssh $SSH_OPTS devops@10.192.15.2 "docker load -i ~/test-app.tar && rm ~/test-app.tar"
+          echo 'echo "${{ secrets.SSH_PASSPHRASE }}"' > ~/.ssh/passphrase.sh
+          chmod +x ~/.ssh/passphrase.sh
           
-          echo "🚀 Uploading to Worker (10.192.15.5) via Master..."
-          # ProxyJump (-J) menggunakan user devops di master untuk lompat ke adminlintas di worker
-          scp $SSH_OPTS -J devops@10.192.15.2 test-app.tar adminlintas@10.192.15.5:~/test-app.tar
-          ssh $SSH_OPTS -J devops@10.192.15.2 adminlintas@10.192.15.5 "docker load -i ~/test-app.tar && rm ~/test-app.tar"
+          cat <<EOF > ~/.ssh/config
+          Host *
+            StrictHostKeyChecking no
+            UserKnownHostsFile /dev/null
+            AddKeysToAgent yes
+          EOF
+
+          eval $(ssh-agent -s)
+          DISPLAY=:0 SSH_ASKPASS=~/.ssh/passphrase.sh setsid ssh-add ~/.ssh/id_rsa < /dev/null
           
-          echo "✅ Deployment Selesai!"
+          echo "SSH_AUTH_SOCK=$SSH_AUTH_SOCK" >> $GITHUB_ENV
+          echo "SSH_AGENT_PID=$SSH_AGENT_PID" >> $GITHUB_ENV
+
+      - name: Transfer and Load Image
+        run: |
+          # Tes koneksi dulu ke Master
+          ping -c 3 10.192.15.2
+          
+          echo "🚀 Sending to Master (10.192.15.2)..."
+          scp test-app.tar devops@10.192.15.2:~/test-app.tar
+          ssh devops@10.192.15.2 "docker load -i ~/test-app.tar && rm ~/test-app.tar"
+          
+          echo "🚀 Sending to Worker (10.192.15.5) via Master..."
+          scp -J devops@10.192.15.2 test-app.tar adminlintas@10.192.15.5:~/test-app.tar
+          ssh -J devops@10.192.15.2 adminlintas@10.192.15.5 "docker load -i ~/test-app.tar && rm ~/test-app.tar"
+          
+          echo "✅ Semua beres!"
