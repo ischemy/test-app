@@ -7,7 +7,7 @@ import (
 	"net/http"
 	"os"
 
-	_ "://github.com"
+	_ "github.com/lib/pq"
 )
 
 func main() {
