@@ -1,4 +1,4 @@
-name: CI/CD test-app Biznet VPN
+name: Biznet 64bit K8s VPN Deploy
 
 on:
   push:
@@ -11,63 +11,99 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # 1. SETUP VPN WIREGUARD
-      - name: Install & Connect WireGuard
+      # 1. SETUP VPN (Menembus Biznet GIO via Port UDP 51820)
+      - name: Connect WireGuard VPN
         run: |
           sudo apt-get update && sudo apt-get install -y wireguard
           echo "${{ secrets.WG_CONFIG }}" > wg0.conf
+          chmod 600 wg0.conf
           sudo wg-quick up ./wg0.conf
-          # Tunggu handshake VPN stabil
+          # Tunggu handshake & verifikasi jalur internal
           sleep 5
-          # Verifikasi jalur ke Master & DB
-          ping -c 2 10.192.15.4
-          ping -c 2 10.192.15.6
+          ping -c 2 10.192.15.4 # Ping Master (Jumphost)
+          ping -c 2 10.192.15.6 # Ping Database
 
-      # 2. SETUP SSH ACCESS
+      # 2. SETUP SSH ACCESS (Kunci untuk Master & Worker)
       - name: Setup SSH Key
         run: |
           mkdir -p ~/.ssh
           echo "${{ secrets.SSH_KEY }}" > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
-          # Scan host via jalur VPN agar tidak ditanya fingerprint (Yes/No)
-          ssh-keyscan -H 10.192.15.4 10.192.15.5 >> ~/.ssh/known_hosts
+          # Daftarkan fingerprint semua node internal agar tidak interaktif
+          ssh-keyscan -H 10.192.15.4 10.192.15.5 10.192.15.6 >> ~/.ssh/known_hosts
 
-      # 3. BUILD & EXPORT IMAGE (64-bit Alpine)
-      - name: Build and Export Docker Image
+      # 3. BUILD & EXPORT DOCKER IMAGE
+      - name: Build and Export Image
         run: |
-          docker build -t test-app:local .
-          docker save test-app:local -o test-app.tar
+          docker build -t test-app:latest .
+          docker save test-app:latest -o test-app.tar
 
-      # 4. TRANSFER & DEPLOY (Kirim via SCP VPN)
-      - name: Remote Deploy to Biznet Nodes
+      # 4. TRANSFER IMAGE VIA JUMPHOST (Master Node)
+      - name: Transfer Image to Cluster
         run: |
-          # Node list sesuai environment Anda
-          NODES="10.192.15.4 10.192.15.5"
+          # A. Kirim ke Master Node (Jumphost)
+          ssh adminlintas@10.192.15.4 "mkdir -p ~/test-app"
+          scp test-app.tar adminlintas@10.192.15.4:~/test-app/
           
-          for ip in $NODES; do
-            echo "------------------------------------------"
-            echo "Deploying to adminlintas@$ip..."
-            
-            # Buat direktori jika belum ada
-            ssh adminlintas@$ip "mkdir -p ~/test-app"
-            
-            # Kirim file .tar dan docker-compose.yml
-            scp test-app.tar docker-compose.yml adminlintas@$ip:~/test-app/
-            
-            # Load image dan jalankan (Injeksi Secrets langsung)
-            ssh adminlintas@$ip "
-                cd ~/test-app && \
-                docker load -i test-app.tar && \
-                DB_HOST='${{ secrets.DB_HOST }}' \
-                DB_USER='${{ secrets.DB_USER }}' \
-                DB_NAME='${{ secrets.DB_NAME }}' \
-                DB_PASSWORD='${{ secrets.DB_PASSWORD }}' \
-                docker-compose up -d && \
-                rm test-app.tar
-            "
-          done
+          # B. Kirim ke Worker Node LOMPAT lewat Master (ProxyJump)
+          ssh -J adminlintas@10.192.15.4 adminlintas@10.192.15.5 "mkdir -p ~/test-app"
+          scp -J adminlintas@10.192.15.4 test-app.tar adminlintas@10.192.15.5:~/test-app/
 
-      # 5. DISCONNECT VPN (Cleanup)
+      # 5. LOAD IMAGE & DEPLOY KUBERNETES
+      - name: Load Image and Apply K8s
+        run: |
+          # Load image di semua node agar pod bisa Running (imagePullPolicy: Never)
+          ssh adminlintas@10.192.15.4 "docker load -i ~/test-app/test-app.tar && rm ~/test-app/test-app.tar"
+          ssh -J adminlintas@10.192.15.4 adminlintas@10.192.15.5 "docker load -i ~/test-app/test-app.tar && rm ~/test-app/test-app.tar"
+          
+          # Eksekusi Manifest Deployment di Master
+          ssh adminlintas@10.192.15.4 "kubectl apply -f - <<EOF
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: test-app
+          spec:
+            replicas: 2
+            selector:
+              matchLabels:
+                app: test-app
+            template:
+              metadata:
+                labels:
+                  app: test-app
+              spec:
+                containers:
+                - name: test-app
+                  image: test-app:latest
+                  imagePullPolicy: Never
+                  ports:
+                  - containerPort: 8080
+                  env:
+                  - name: DB_HOST
+                    value: '10.192.15.6'
+                  - name: DB_USER
+                    value: 'user_testapp'
+                  - name: DB_PASSWORD
+                    value: '${{ secrets.DB_PASSWORD }}'
+                  - name: DB_NAME
+                    value: 'db_testapp'
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: test-app-service
+          spec:
+            type: NodePort
+            selector:
+              app: test-app
+            ports:
+            - port: 80
+              targetPort: 8080
+              nodePort: 30080
+          EOF
+          "
+
+      # 6. CLEANUP VPN
       - name: Disconnect VPN
         if: always()
         run: sudo wg-quick down ./wg0.conf
