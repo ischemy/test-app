@@ -1,1 +1,63 @@
 
+name: Deploy test-app via WireGuard
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # 1. BANGUN TUNNEL VPN (Agar GitHub bisa melihat 10.192.15.x)
+      - name: Connect WireGuard VPN
+        run: |
+          sudo apt-get update && sudo apt-get install -y wireguard
+          echo "${{ secrets.WG_CONFIG }}" > wg0.conf
+          sudo wg-quick up ./wg0.conf
+
+      # 2. SETUP SSH KEY (Untuk scp & ssh ke node internal)
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          # Daftarkan host agar tidak muncul prompt (StrictHostKeyChecking)
+          ssh-keyscan -H 10.192.15.4 10.192.15.5 >> ~/.ssh/known_hosts
+
+      # 3. BUILD & EXPORT IMAGE (Sesuai tahap Jenkins Anda)
+      - name: Build and Export Image
+        run: |
+          docker build -t test-app:local .
+          docker save test-app:local -o test-app.tar
+
+      # 4. SECURE REMOTE DEPLOY (Sesuai logika script Jenkins Anda)
+      - name: Deploy to Biznet Nodes
+        run: |
+          # Loop untuk kirim ke lintaskubeapp1 & lintaskubeapp2
+          for node in 10.192.15.4 10.192.15.5; do
+            echo "Deploying to adminlintas@$node..."
+            
+            # Kirim file .tar dan docker-compose.yml via VPN
+            scp test-app.tar docker-compose.yml adminlintas@$node:~/test-app/
+            
+            # Load image dan jalankan container dengan Secrets
+            ssh adminlintas@$node "
+                cd ~/test-app && \
+                docker load -i test-app.tar && \
+                DB_HOST='${{ secrets.DB_HOST }}' \
+                DB_USER='${{ secrets.DB_USER }}' \
+                DB_NAME='${{ secrets.DB_NAME }}' \
+                DB_PASSWORD='${{ secrets.DB_PASSWORD }}' \
+                docker-compose up -d && \
+                rm test-app.tar
+            "
+          done
+
+      # 5. BERSIHKAN VPN
+      - name: Disconnect VPN
+        if: always()
+        run: sudo wg-quick down ./wg0.conf
