@@ -44,10 +44,8 @@ jobs:
           echo "${{ secrets.SSH_PRIVATE_KEY_MASTER }}" > ~/.ssh/id_master
           echo "${{ secrets.SSH_PRIVATE_KEY_WORKER }}" > ~/.ssh/id_worker
           chmod 600 ~/.ssh/id_master ~/.ssh/id_worker
-          
           echo "echo '${{ secrets.SSH_PASSPHRASE }}'" > ~/.ssh/askpass.sh
           chmod +x ~/.ssh/askpass.sh
-          
           cat <<EOF > ~/.ssh/config
           Host *
             StrictHostKeyChecking no
@@ -55,7 +53,6 @@ jobs:
             ForwardAgent yes
             AddKeysToAgent yes
           EOF
-
           eval $(ssh-agent -s)
           export DISPLAY=:0
           export SSH_ASKPASS=~/.ssh/askpass.sh
@@ -63,48 +60,36 @@ jobs:
           setsid ssh-add ~/.ssh/id_worker < /dev/null
           echo "SSH_AUTH_SOCK=$SSH_AUTH_SOCK" >> $GITHUB_ENV
 
-      - name: Deploy via Master Bridge (Multi-Node Sync)
+      - name: Deploy via Master Bridge (Fixed Structure)
         env:
           SSH_AUTH_SOCK: ${{ env.SSH_AUTH_SOCK }}
         run: |
-          echo "🚀 Sending artifacts to Master..."
           scp test-app.tar deployment.yaml docker-compose.yml devops@10.192.15.2:~/
           
           ssh -A devops@10.192.15.2 << 'EOF'
             set -e
-            
-            # DAFTAR SEMUA WORKER NODE (Tambahkan IP lintaskubeapp1 di sini)
-            # Contoh: 10.192.15.5 (app2), 10.192.15.x (app1)
-            WORKER_IPS=("10.192.15.5" "10.192.15.4") # Sesuaikan IP lintaskubeapp1 Anda
+            WORKER_IPS=("10.192.15.5" "10.192.15.4")
             
             for IP in "${WORKER_IPS[@]}"; do
               echo "📦 Syncing image to Node $IP..."
               scp -o StrictHostKeyChecking=no ~/test-app.tar adminlintas@$IP:~/
               
-              ssh -o StrictHostKeyChecking=no adminlintas@$IP << 'NODE_EOF'
+              # Gunakan perintah string tunggal untuk menghindari nested heredoc error
+              ssh -o StrictHostKeyChecking=no adminlintas@$IP "
                 set -e
-                echo "🐳 Loading to Containerd (Namespace k8s.io) on $HOSTNAME..."
-                # Load ke docker untuk compose
+                echo '🐳 Loading to Runtime on \$HOSTNAME...'
                 docker load -i ~/test-app.tar
-                # Import ke containerd agar Kubeadm bisa melihat image
                 sudo ctr -n k8s.io images import ~/test-app.tar
                 rm ~/test-app.tar
-            NODE_EOF
+              "
             done
 
-            # Jalankan Docker Compose (Spesifik di lintaskubeapp2)
-            echo "🚀 Restarting Docker Compose on Primary Worker..."
-            ssh -o StrictHostKeyChecking=no adminlintas@10.192.15.5 << 'COMPOSE_EOF'
-              cat <<ENV > .env
-              DB_HOST=${{ secrets.DB_HOST }}
-              DB_USER=${{ secrets.DB_USER }}
-              DB_NAME=${{ secrets.DB_NAME }}
-              DB_PASSWORD=${{ secrets.DB_PASSWORD }}
-          ENV
+            echo "🚀 Restarting Docker Compose on Primary Worker (10.192.15.5)..."
+            ssh -o StrictHostKeyChecking=no adminlintas@10.192.15.5 "
+              printf 'DB_HOST=${{ secrets.DB_HOST }}\nDB_USER=${{ secrets.DB_USER }}\nDB_NAME=${{ secrets.DB_NAME }}\nDB_PASSWORD=${{ secrets.DB_PASSWORD }}' > .env
               docker compose up -d || docker-compose up -d
-          COMPOSE_EOF
+            "
 
-            # UPDATE KUBERNETES
             echo "🏗️ Updating K8s Secrets & Deployment..."
             printf "DB_HOST=${{ secrets.DB_HOST }}\nDB_USER=${{ secrets.DB_USER }}\nDB_PASSWORD=${{ secrets.DB_PASSWORD }}\nDB_NAME=${{ secrets.DB_NAME }}" > .db.env
             kubectl create secret generic db-secret --from-env-file=.db.env --dry-run=client -o yaml | kubectl apply -f -
@@ -114,5 +99,5 @@ jobs:
             kubectl rollout restart deployment/test-app-deployment
             
             rm ~/test-app.tar ~/deployment.yaml ~/docker-compose.yml
-            echo "✅ ALL NODES SYNCED & DEPLOYED!"
+            echo "✅ DEPLOYMENT FINISHED!"
           EOF
