@@ -47,8 +47,7 @@ jobs:
           echo "${{ secrets.SSH_PRIVATE_KEY_WORKER }}" > ~/.ssh/id_worker
           chmod 600 ~/.ssh/id_master ~/.ssh/id_worker
           
-          # Buat script askpass untuk menyuntikkan passphrase otomatis
-          # Pastikan secret SSH_PASSPHRASE berisi password kunci Anda
+          # Script askpass untuk menyuntikkan passphrase secara otomatis
           echo "echo '${{ secrets.SSH_PASSPHRASE }}'" > ~/.ssh/askpass.sh
           chmod +x ~/.ssh/askpass.sh
           
@@ -77,16 +76,14 @@ jobs:
           SSH_AUTH_SOCK: ${{ env.SSH_AUTH_SOCK }}
         run: |
           echo "🚀 Sending artifacts to Master Node..."
-          # SCP akan menggunakan id_master dari Agent secara otomatis
           scp test-app.tar deployment.yaml docker-compose.yml devops@10.192.15.2:~/
           
-          # SSH ke Master dengan Agent Forwarding (-A) agar id_worker bisa dipakai Master
+          # SSH ke Master dengan Agent Forwarding (-A)
           ssh -A devops@10.192.15.2 << 'EOF'
             set -e
             
             # --- BAGIAN WORKER (DOCKER COMPOSE) ---
             echo "📦 Forwarding to Worker (10.192.15.5)..."
-            # Master melakukan SCP ke Worker menggunakan kunci id_worker yang "transit" di Agent
             scp -o StrictHostKeyChecking=no ~/test-app.tar ~/docker-compose.yml adminlintas@10.192.15.5:~/
             
             ssh -o StrictHostKeyChecking=no adminlintas@10.192.15.5 << 'WORKER_EOF'
@@ -102,7 +99,20 @@ jobs:
               DB_PASSWORD=${{ secrets.DB_PASSWORD }}
           ENV
               
-              docker compose up -d || docker-compose up -d
+              echo "🚀 Starting Docker Compose..."
+              # Deteksi versi docker compose yang terinstal di Worker
+              if docker compose version > /dev/null 2>&1; then
+                echo "Using Docker Compose V2 (docker compose)"
+                docker compose up -d
+              elif docker-compose version > /dev/null 2>&1; then
+                echo "Using Docker Compose V1 (docker-compose)"
+                docker-compose up -d
+              else
+                echo "❌ ERROR: Docker Compose tidak ditemukan di PATH!"
+                # Alternatif: Coba cari di path umum jika command standar gagal
+                /usr/local/bin/docker-compose up -d || { echo "Fatal Error"; exit 1; }
+              fi
+              
               rm ~/test-app.tar
           WORKER_EOF
 
