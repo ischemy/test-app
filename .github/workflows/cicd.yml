@@ -19,6 +19,7 @@ jobs:
       - name: Build and Save Image
         run: |
           go mod tidy
+          # Build image sekali saja di runner
           docker build -t test-app:local .
           docker save test-app:local -o test-app.tar
 
@@ -37,20 +38,15 @@ jobs:
           sudo wg set wg0 private-key ./private.key peer "$WG_PUB" endpoint "$WG_END" allowed-ips 10.192.15.0/24
           sudo ip link set up dev wg0
           sleep 5
-          ping -c 3 10.192.15.2
 
       - name: Setup Multi-SSH Agent with Passphrase
         run: |
           mkdir -p ~/.ssh
-          # Simpan kedua private key ke file berbeda
           echo "${{ secrets.SSH_PRIVATE_KEY_MASTER }}" > ~/.ssh/id_master
           echo "${{ secrets.SSH_PRIVATE_KEY_WORKER }}" > ~/.ssh/id_worker
           chmod 600 ~/.ssh/id_master ~/.ssh/id_worker
-          
-          # Script askpass untuk menyuntikkan passphrase secara otomatis
           echo "echo '${{ secrets.SSH_PASSPHRASE }}'" > ~/.ssh/askpass.sh
           chmod +x ~/.ssh/askpass.sh
-          
           cat <<EOF > ~/.ssh/config
           Host *
             StrictHostKeyChecking no
@@ -58,40 +54,42 @@ jobs:
             ForwardAgent yes
             AddKeysToAgent yes
           EOF
-
-          # Jalankan SSH Agent
           eval $(ssh-agent -s)
-          
-          # Gunakan SSH_ASKPASS untuk mendaftarkan kedua kunci tanpa interaksi manual
           export DISPLAY=:0
           export SSH_ASKPASS=~/.ssh/askpass.sh
           setsid ssh-add ~/.ssh/id_master < /dev/null
           setsid ssh-add ~/.ssh/id_worker < /dev/null
-          
-          # Simpan SSH_AUTH_SOCK agar step berikutnya bisa akses Agent
           echo "SSH_AUTH_SOCK=$SSH_AUTH_SOCK" >> $GITHUB_ENV
 
-      - name: Deploy via Master Bridge (Double Key Relay)
+      - name: Deploy via Master Bridge
         env:
           SSH_AUTH_SOCK: ${{ env.SSH_AUTH_SOCK }}
         run: |
-          echo "🚀 Sending artifacts to Master Node..."
+          echo "🚀 Sending artifacts to Master..."
           scp test-app.tar deployment.yaml docker-compose.yml devops@10.192.15.2:~/
           
-          # SSH ke Master dengan Agent Forwarding (-A)
           ssh -A devops@10.192.15.2 << 'EOF'
             set -e
             
-            # --- BAGIAN WORKER (DOCKER COMPOSE) ---
+            # --- MASTER SIDE: LOAD IMAGE UNTUK MASTER NODE ---
+            echo "📦 Loading image on Master..."
+            docker load -i ~/test-app.tar
+            sudo ctr -n k8s.io images import ~/test-app.tar || true
+
+            # --- WORKER SIDE: LOAD IMAGE UNTUK WORKER NODE ---
             echo "📦 Forwarding to Worker (10.192.15.5)..."
             scp -o StrictHostKeyChecking=no ~/test-app.tar ~/docker-compose.yml adminlintas@10.192.15.5:~/
             
             ssh -o StrictHostKeyChecking=no adminlintas@10.192.15.5 << 'WORKER_EOF'
               set -e
-              echo "🐳 Loading image on Worker..."
+              echo "🐳 Loading image to Docker (for Compose)..."
               docker load -i ~/test-app.tar
               
-              echo "📝 Creating .env for Docker Compose..."
+              echo "☸️ Loading image to Containerd (for K8s/Kubeadm)..."
+              # Kubeadm butuh image di namespace k8s.io
+              sudo ctr -n k8s.io images import ~/test-app.tar
+              
+              echo "📝 Creating .env..."
               cat <<ENV > .env
               DB_HOST=${{ secrets.DB_HOST }}
               DB_USER=${{ secrets.DB_USER }}
@@ -99,39 +97,19 @@ jobs:
               DB_PASSWORD=${{ secrets.DB_PASSWORD }}
           ENV
               
-              echo "🚀 Starting Docker Compose..."
-              # Deteksi versi docker compose yang terinstal di Worker
-              if docker compose version > /dev/null 2>&1; then
-                echo "Using Docker Compose V2 (docker compose)"
-                docker compose up -d
-              elif docker-compose version > /dev/null 2>&1; then
-                echo "Using Docker Compose V1 (docker-compose)"
-                docker-compose up -d
-              else
-                echo "❌ ERROR: Docker Compose tidak ditemukan di PATH!"
-                # Alternatif: Coba cari di path umum jika command standar gagal
-                /usr/local/bin/docker-compose up -d || { echo "Fatal Error"; exit 1; }
-              fi
-              
+              docker compose up -d || docker-compose up -d
               rm ~/test-app.tar
           WORKER_EOF
 
-            # --- BAGIAN MASTER (KUBERNETES) ---
+            # --- K8s DEPLOYMENT ---
             echo "🏗️ Updating K8s Secrets & Deployment..."
-            cat <<SEC > .db.env
-            DB_HOST=${{ secrets.DB_HOST }}
-            DB_USER=${{ secrets.DB_USER }}
-            DB_PASSWORD=${{ secrets.DB_PASSWORD }}
-            DB_NAME=${{ secrets.DB_NAME }}
-          SEC
-            
+            printf "DB_HOST=${{ secrets.DB_HOST }}\nDB_USER=${{ secrets.DB_USER }}\nDB_PASSWORD=${{ secrets.DB_PASSWORD }}\nDB_NAME=${{ secrets.DB_NAME }}" > .db.env
             kubectl create secret generic db-secret --from-env-file=.db.env --dry-run=client -o yaml | kubectl apply -f -
             rm .db.env
 
             kubectl apply -f ~/deployment.yaml
             kubectl rollout restart deployment/test-app-deployment
             
-            # Cleanup di Master
             rm ~/test-app.tar ~/deployment.yaml ~/docker-compose.yml
             echo "✅ DEPLOYMENT FINISHED!"
           EOF
