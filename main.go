@@ -32,7 +32,7 @@ func main() {
 			fmt.Fprintf(w, "❌ test-app gagal konek ke DB di 10.192.15.6: %v", err)
 			return
 		}
-		fmt.Fprint(w, "✅ test-app berhasil koneksi ke PostgreSQL Lintasdbapp1!")
+		fmt.Fprint(w, "✅ test-app berhasil koneksi ke PostgreSQL Lintasdbapp1 yes!")
 	})
 
 	log.Println("test-app start on port 8080...")
