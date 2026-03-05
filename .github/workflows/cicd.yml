@@ -1,4 +1,4 @@
-name: CI/CD K8s & Docker Compose Deploy with Double Keys
+name: CI/CD K8s & Docker Compose Deploy via Bridge
 
 on:
   push:
@@ -37,71 +37,91 @@ jobs:
           sudo wg set wg0 private-key ./private.key peer "$WG_PUB" endpoint "$WG_END" allowed-ips 10.192.15.0/24
           sudo ip link set up dev wg0
           sleep 5
+          ping -c 3 10.192.15.2
 
-      - name: Setup Multi-SSH Agent
+      - name: Setup Multi-SSH Agent with Passphrase
         run: |
           mkdir -p ~/.ssh
-          # Simpan kunci Master
+          # Simpan kedua private key ke file berbeda
           echo "${{ secrets.SSH_PRIVATE_KEY_MASTER }}" > ~/.ssh/id_master
-          # Simpan kunci Worker
           echo "${{ secrets.SSH_PRIVATE_KEY_WORKER }}" > ~/.ssh/id_worker
           chmod 600 ~/.ssh/id_master ~/.ssh/id_worker
           
-          # Setup SSH Config dengan ForwardAgent
+          # Buat script askpass untuk menyuntikkan passphrase otomatis
+          # Pastikan secret SSH_PASSPHRASE berisi password kunci Anda
+          echo "echo '${{ secrets.SSH_PASSPHRASE }}'" > ~/.ssh/askpass.sh
+          chmod +x ~/.ssh/askpass.sh
+          
           cat <<EOF > ~/.ssh/config
           Host *
             StrictHostKeyChecking no
+            UserKnownHostsFile /dev/null
             ForwardAgent yes
+            AddKeysToAgent yes
           EOF
 
-          # Jalankan Agent dan daftarkan KEDUA kunci
+          # Jalankan SSH Agent
           eval $(ssh-agent -s)
-          # Gunakan SSH_ASKPASS jika kunci pakai passphrase, jika tidak langsung ssh-add
-          ssh-add ~/.ssh/id_master
-          ssh-add ~/.ssh/id_worker
           
+          # Gunakan SSH_ASKPASS untuk mendaftarkan kedua kunci tanpa interaksi manual
+          export DISPLAY=:0
+          export SSH_ASKPASS=~/.ssh/askpass.sh
+          setsid ssh-add ~/.ssh/id_master < /dev/null
+          setsid ssh-add ~/.ssh/id_worker < /dev/null
+          
+          # Simpan SSH_AUTH_SOCK agar step berikutnya bisa akses Agent
           echo "SSH_AUTH_SOCK=$SSH_AUTH_SOCK" >> $GITHUB_ENV
 
-      - name: Deploy via Master Bridge
+      - name: Deploy via Master Bridge (Double Key Relay)
         env:
           SSH_AUTH_SOCK: ${{ env.SSH_AUTH_SOCK }}
         run: |
-          # Step 1: Kirim ke Master menggunakan kunci Master (otomatis dipilih oleh agent)
+          echo "🚀 Sending artifacts to Master Node..."
+          # SCP akan menggunakan id_master dari Agent secara otomatis
           scp test-app.tar deployment.yaml docker-compose.yml devops@10.192.15.2:~/
           
-          # Step 2: SSH ke Master dengan -A agar kunci Worker ikut terbawa ke Master
+          # SSH ke Master dengan Agent Forwarding (-A) agar id_worker bisa dipakai Master
           ssh -A devops@10.192.15.2 << 'EOF'
             set -e
             
+            # --- BAGIAN WORKER (DOCKER COMPOSE) ---
             echo "📦 Forwarding to Worker (10.192.15.5)..."
-            # Master akan menggunakan 'id_worker' yang dipinjam dari GitHub Agent
+            # Master melakukan SCP ke Worker menggunakan kunci id_worker yang "transit" di Agent
             scp -o StrictHostKeyChecking=no ~/test-app.tar ~/docker-compose.yml adminlintas@10.192.15.5:~/
             
             ssh -o StrictHostKeyChecking=no adminlintas@10.192.15.5 << 'WORKER_EOF'
               set -e
+              echo "🐳 Loading image on Worker..."
               docker load -i ~/test-app.tar
+              
+              echo "📝 Creating .env for Docker Compose..."
               cat <<ENV > .env
               DB_HOST=${{ secrets.DB_HOST }}
               DB_USER=${{ secrets.DB_USER }}
               DB_NAME=${{ secrets.DB_NAME }}
               DB_PASSWORD=${{ secrets.DB_PASSWORD }}
           ENV
+              
               docker compose up -d || docker-compose up -d
               rm ~/test-app.tar
           WORKER_EOF
 
-            # Deploy K8s di Master
+            # --- BAGIAN MASTER (KUBERNETES) ---
+            echo "🏗️ Updating K8s Secrets & Deployment..."
             cat <<SEC > .db.env
             DB_HOST=${{ secrets.DB_HOST }}
             DB_USER=${{ secrets.DB_USER }}
             DB_PASSWORD=${{ secrets.DB_PASSWORD }}
             DB_NAME=${{ secrets.DB_NAME }}
           SEC
+            
             kubectl create secret generic db-secret --from-env-file=.db.env --dry-run=client -o yaml | kubectl apply -f -
             rm .db.env
+
             kubectl apply -f ~/deployment.yaml
             kubectl rollout restart deployment/test-app-deployment
             
+            # Cleanup di Master
             rm ~/test-app.tar ~/deployment.yaml ~/docker-compose.yml
-            echo "✅ DEPLOYMENT SUCCESS!"
+            echo "✅ DEPLOYMENT FINISHED!"
           EOF
