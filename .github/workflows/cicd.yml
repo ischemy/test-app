@@ -1,4 +1,4 @@
-name: CI/CD K8s Deploy via Master-Worker Bridge
+name: CI/CD K8s & Docker Compose Deploy via Bridge
 
 on:
   push:
@@ -19,7 +19,6 @@ jobs:
       - name: Build and Save Image
         run: |
           go mod tidy
-          # Gunakan tag :local agar sesuai dengan deployment.yaml
           docker build -t test-app:local .
           docker save test-app:local -o test-app.tar
 
@@ -43,9 +42,7 @@ jobs:
       - name: Setup SSH for GitHub to Master
         run: |
           mkdir -p ~/.ssh
-          cat <<'EOF' > ~/.ssh/id_rsa
-          ${{ secrets.SSH_PRIVATE_KEY }}
-          EOF
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
           
           echo "echo '${{ secrets.SSH_PASSPHRASE }}'" > ~/.ssh/passphrase.sh
@@ -55,48 +52,67 @@ jobs:
           Host *
             StrictHostKeyChecking no
             UserKnownHostsFile /dev/null
-            AddKeysToAgent yes
           EOF
 
           eval $(ssh-agent -s)
           DISPLAY=:0 SSH_ASKPASS=~/.ssh/passphrase.sh setsid ssh-add ~/.ssh/id_rsa < /dev/null
           echo "SSH_AUTH_SOCK=$SSH_AUTH_SOCK" >> $GITHUB_ENV
 
-      - name: Deploy via Master Bridge (Trust Local SSH)
+      - name: Deploy via Master Bridge (K8s & Docker Compose)
+        env:
+          SSH_AUTH_SOCK: ${{ env.SSH_AUTH_SOCK }}
         run: |
-          # 1. Kirim Image & Manifest ke Master (10.192.15.2)
+          # 1. Kirim semua file yang dibutuhkan ke Master (Jump Host)
           echo "🚀 Sending files to Master..."
-          scp test-app.tar deployment.yaml devops@10.192.15.2:~/
+          scp test-app.tar deployment.yaml docker-compose.yml devops@10.192.15.2:~/
           
-          # 2. Instruksi Master untuk melakukan estafet ke Worker
-          ssh devops@10.192.15.2 "
+          # 2. Eksekusi Remote di Master Node
+          ssh devops@10.192.15.2 << 'EOF'
             set -e
             
-            echo '📦 Loading image on Master...'
-            docker load -i ~/test-app.tar
+            # --- BAGIAN A: WORKER NODE (DOCKER COMPOSE) ---
+            echo "📦 Forwarding image & compose to Worker (10.192.15.5)..."
+            scp -o StrictHostKeyChecking=no ~/test-app.tar ~/docker-compose.yml adminlintas@10.192.15.5:~/
             
-            # Kita gunakan SSH lokal milik Master (~/.ssh/id_rsa asli di server) 
-            # yang sudah terbukti bisa SSH ke adminlintas tanpa password.
+            ssh -o StrictHostKeyChecking=no adminlintas@10.192.15.5 << 'WORKER_EOF'
+              set -e
+              echo "🐳 Loading image on Worker..."
+              docker load -i ~/test-app.tar
+              
+              echo "📝 Creating .env for Docker Compose..."
+              cat <<ENV > .env
+              DB_HOST=${{ secrets.DB_HOST }}
+              DB_USER=${{ secrets.DB_USER }}
+              DB_PASSWORD=${{ secrets.DB_PASSWORD }}
+              DB_NAME=${{ secrets.DB_NAME }}
+          ENV
+              
+              echo "🚀 Starting Docker Compose..."
+              # Menggunakan docker compose (v2) atau docker-compose (v1)
+              docker compose up -d || docker-compose up -d
+              
+              rm ~/test-app.tar
+          WORKER_EOF
+
+            # --- BAGIAN B: MASTER NODE (KUBERNETES) ---
+            echo "🏗️ Updating K8s Secrets..."
+            cat <<SEC > .db.env
+            DB_HOST=${{ secrets.DB_HOST }}
+            DB_USER=${{ secrets.DB_USER }}
+            DB_PASSWORD=${{ secrets.DB_PASSWORD }}
+            DB_NAME=${{ secrets.DB_NAME }}
+          SEC
             
-            echo '🚀 Forwarding image from Master to Worker (10.192.15.5)...'
-            scp -o StrictHostKeyChecking=no ~/test-app.tar adminlintas@10.192.15.5:~/
-            
-            echo '📦 Loading image on Worker...'
-            ssh -o StrictHostKeyChecking=no adminlintas@10.192.15.5 'docker load -i ~/test-app.tar && rm ~/test-app.tar'
-            
-            # 3. Update Kubernetes Resources di Master
-            echo '🏗️ Updating K8s Secrets and Deployment...'
             kubectl create secret generic db-secret \
-              --from-literal=DB_HOST='${{ secrets.DB_HOST }}' \
-              --from-literal=DB_USER='${{ secrets.DB_USER }}' \
-              --from-literal=DB_PASSWORD='${{ secrets.DB_PASSWORD }}' \
-              --from-literal=DB_NAME='${{ secrets.DB_NAME }}' \
+              --from-env-file=.db.env \
               --dry-run=client -o yaml | kubectl apply -f -
-            
+            rm .db.env
+
+            echo "☸️ Applying K8s Manifests..."
             kubectl apply -f ~/deployment.yaml
             kubectl rollout restart deployment/test-app-deployment
             
-            # Bersihkan file sementara
-            rm ~/test-app.tar ~/deployment.yaml
-            echo '✅ DEPLOYMENT FINISHED!'
-          "
+            # Cleanup di Master
+            rm ~/test-app.tar ~/deployment.yaml ~/docker-compose.yml
+            echo "✅ ALL DEPLOYMENTS FINISHED!"
+          EOF
